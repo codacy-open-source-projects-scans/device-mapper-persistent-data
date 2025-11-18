@@ -1,34 +1,31 @@
 #!/bin/bash
 
-test_name="tmeta_with_empty_roots"
+test_name="tmeta_with_shared_internal_root"
 metadata_dump="${test_name}.bin"
 metadata_pack="${test_name}.pack"
 
-vg=vg1
+vg=dmtest
 tp=tp1
-pool_size=64m
+pool_size=1g
 metadata_size=4m
 blocksize=64k
 lv_name=lv1
-lv_size=16m
+lv_size=512m
 snap_name=snap1
 
 lvcreate ${vg} --type thin-pool --name ${tp} --size ${pool_size} \
          --chunksize ${blocksize} --poolmetadatasize ${metadata_size} \
          -Zn --poolmetadataspare=n
 
-# commit a metadata transaction
-dmsetup status "${vg}-${tp}"
-
 lvcreate ${vg} --type thin --name ${lv_name} --thinpool ${tp} --virtualsize ${lv_size}
 
 # commit a metadata transaction
 dmsetup status "${vg}-${tp}-tpool"
 
-# write some data ...
-dd if=/dev/zero of="/dev/mapper/${vg}-${lv_name}" bs=1M count=4
+# write sufficient amount of data to produce an internal nodes
+dd if=/dev/zero of="/dev/mapper/${vg}-${lv_name}" bs=1M count=100
 
-# create a snapshot
+# create a snapshot, producing a shared internal node
 lvcreate "${vg}/${lv_name}" --snapshot --name ${snap_name}
 
 lvchange -an "${vg}/${lv_name}"

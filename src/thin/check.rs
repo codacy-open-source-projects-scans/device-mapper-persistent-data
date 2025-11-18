@@ -3,8 +3,6 @@ use fixedbitset::FixedBitSet;
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,8 +14,8 @@ use crate::pdata::btree_layer_walker::*;
 use crate::pdata::btree_utils::*;
 use crate::pdata::space_map::aggregator::*;
 use crate::pdata::space_map::aggregator_load::*;
-use crate::pdata::space_map::aggregator_repair::*;
 use crate::pdata::space_map::common::*;
+use crate::pdata::space_map::repairer::*;
 use crate::pdata::unpack::*;
 use crate::report::*;
 use crate::thin::block_time::*;
@@ -25,25 +23,8 @@ use crate::thin::device_detail::*;
 use crate::thin::metadata_repair::is_superblock_consistent;
 use crate::thin::superblock::*;
 use crate::utils::future::spawn_future;
+use crate::utils::prof::*;
 use crate::utils::ranged_bitset_iter::*;
-
-//------------------------------------------
-
-fn get_memory_usage() -> Result<usize, std::io::Error> {
-    let mut s = String::new();
-    File::open("/proc/self/statm")?.read_to_string(&mut s)?;
-    let pages = s
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
-    Ok((pages * 4096) / (1024 * 1024))
-}
-
-fn print_mem(report: &Report, msg: &str) {
-    report.debug(&format!("{}: {} meg", msg, get_memory_usage().unwrap()));
-}
 
 //------------------------------------------
 // minimum number of entries of a node with 64-bit mapped type
@@ -1562,7 +1543,7 @@ pub fn check(opts: ThinCheckOptions) -> Result<()> {
     if !data_leaks.is_empty() {
         if opts.auto_repair || opts.clear_needs_check {
             report.warning("Repairing data leaks.");
-            repair_space_map(engine.clone(), data_leaks, &data_sm)?;
+            repair_space_map(engine.as_ref(), data_leaks, data_sm.as_ref())?;
         } else if !opts.ignore_non_fatal {
             return Err(anyhow!(concat!(
                 "data space map contains leaks\n",
@@ -1574,7 +1555,7 @@ pub fn check(opts: ThinCheckOptions) -> Result<()> {
     if !metadata_leaks.is_empty() {
         if opts.auto_repair || opts.clear_needs_check {
             report.warning("Repairing metadata leaks.");
-            repair_space_map(engine.clone(), metadata_leaks, &metadata_sm)?;
+            repair_space_map(engine.as_ref(), metadata_leaks, metadata_sm.as_ref())?;
         } else if !opts.ignore_non_fatal {
             return Err(anyhow!(concat!(
                 "metadata space map contains leaks\n",

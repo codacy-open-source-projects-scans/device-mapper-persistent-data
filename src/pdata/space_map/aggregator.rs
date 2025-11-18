@@ -8,7 +8,18 @@ use crate::pdata::space_map::base::*;
 
 const REGION_SIZE: usize = 1024;
 
-enum Rep {
+pub trait Region: Default {
+    fn increment(&mut self, blocks: &[u64]);
+    fn lookup(&self, block: u64, results: &mut [u32]) -> u64;
+    fn set(&mut self, pairs: &[(u64, u32)]);
+    fn test_and_inc(&mut self, blocks: &[u64], results: &mut FixedBitSet, offset: usize);
+    fn rep_size(&self) -> usize;
+    fn nr_allocated(&self) -> u32;
+}
+
+//--------------------------------
+
+enum U32Rep {
     NoCounts,
     Bits(FixedBitSet),
     U8s(Vec<u8>),
@@ -16,9 +27,9 @@ enum Rep {
     U32s(Vec<u32>),
 }
 
-use Rep::*;
+use U32Rep::*;
 
-impl Rep {
+impl U32Rep {
     fn upgrade(&self) -> Self {
         match self {
             NoCounts => Bits(FixedBitSet::with_capacity(REGION_SIZE)),
@@ -38,12 +49,12 @@ impl Rep {
     }
 }
 
-struct Region {
-    rep: Rep,
+pub struct U32Region {
+    rep: U32Rep,
     nr_allocated: u32,
 }
 
-impl Default for Region {
+impl Default for U32Region {
     fn default() -> Self {
         Self {
             rep: NoCounts,
@@ -59,7 +70,7 @@ enum IncResult {
     NeedUpgrade(usize),
 }
 
-impl Region {
+impl U32Region {
     fn increment_(&mut self, blocks: &[u64]) -> IncResult {
         assert!(!blocks.is_empty());
 
@@ -113,21 +124,6 @@ impl Region {
         }
 
         IncResult::Success
-    }
-
-    fn increment(&mut self, blocks: &[u64]) {
-        use IncResult::*;
-
-        let mut idx = 0;
-        loop {
-            match self.increment_(&blocks[idx..]) {
-                Success => break,
-                NeedUpgrade(i) => {
-                    self.rep = self.rep.upgrade();
-                    idx += i;
-                }
-            }
-        }
     }
 
     fn test_and_inc_(
@@ -192,92 +188,6 @@ impl Region {
         }
     }
 
-    pub fn test_and_inc(&mut self, blocks: &[u64], results: &mut FixedBitSet, offset: usize) {
-        let mut processed = 0;
-
-        while processed < blocks.len() {
-            match self.test_and_inc_(&blocks[processed..], results, offset + processed) {
-                IncResult::Success => break,
-                IncResult::NeedUpgrade(i) => {
-                    self.rep = self.rep.upgrade();
-                    processed += i;
-                }
-            }
-        }
-    }
-
-    /// Retrieves the reference counts for a range of blocks.
-    ///
-    /// This method allows you to look up the reference counts for a contiguous range of blocks,
-    /// starting from the specified `begin` block. It fills the provided `results` slice with
-    /// the reference counts and returns the number of blocks actually processed.
-    ///
-    /// # Arguments
-    ///
-    /// * `begin` - The starting block number to look up.
-    /// * `results` - A mutable slice to store the retrieved reference counts. The length of this
-    ///   slice determines the maximum number of blocks to look up.
-    ///
-    /// # Returns
-    ///
-    /// Returns the number of blocks actually processed. This may be less than `results.len()` if
-    /// the range extends beyond the end of the Aggregator's entries.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use thinp::pdata::space_map::aggregator::Aggregator;
-    ///
-    /// let aggregator = Aggregator::new(1000);
-    /// // ... (assume some increments have been performed)
-    ///
-    /// let mut results = vec![0; 10];
-    /// let blocks_read = aggregator.lookup(500, &mut results);
-    /// println!("Read {} blocks, first few counts: {:?}", blocks_read, &results[..3]);
-    /// ```
-    ///
-    /// # Notes
-    ///
-    /// - If `begin` is beyond the last entry in the Aggregator, this method will return 0 and
-    ///   leave `results` unchanged.
-    /// - The method will read up to `results.len()` blocks, but may read fewer if the end of
-    ///   the Aggregator's range is reached.
-    /// - This method is thread-safe and can be called concurrently with `increment` operations.
-    fn lookup(&self, block: u64, results: &mut [u32]) -> u64 {
-        let b = block % REGION_SIZE as u64;
-        let e = (b as usize + results.len()).min(REGION_SIZE);
-
-        match &self.rep {
-            NoCounts => {
-                // All zeroes
-                for i in (b as usize)..e {
-                    results[i - b as usize] = 0;
-                }
-            }
-            Bits(bits) => {
-                for i in (b as usize)..e {
-                    results[i - b as usize] = if bits.contains(i) { 1 } else { 0 };
-                }
-            }
-            U8s(counts) => {
-                for i in (b as usize)..e {
-                    results[i - b as usize] = counts[i] as u32;
-                }
-            }
-            U16s(counts) => {
-                for i in (b as usize)..e {
-                    results[i - b as usize] = counts[i] as u32;
-                }
-            }
-            U32s(counts) => {
-                for i in (b as usize)..e {
-                    results[i - b as usize] = counts[i];
-                }
-            }
-        }
-        e as u64 - b
-    }
-
     fn set_(&mut self, pairs: &[(u64, u32)]) -> IncResult {
         for (i, &(block, ref_count)) in pairs.iter().enumerate() {
             let b = block % REGION_SIZE as u64;
@@ -340,9 +250,73 @@ impl Region {
         }
         IncResult::Success
     }
+}
+
+impl Region for U32Region {
+    fn increment(&mut self, blocks: &[u64]) {
+        use IncResult::*;
+
+        let mut idx = 0;
+        loop {
+            match self.increment_(&blocks[idx..]) {
+                Success => break,
+                NeedUpgrade(i) => {
+                    self.rep = self.rep.upgrade();
+                    idx += i;
+                }
+            }
+        }
+    }
+
+    fn test_and_inc(&mut self, blocks: &[u64], results: &mut FixedBitSet, offset: usize) {
+        let mut processed = 0;
+
+        while processed < blocks.len() {
+            match self.test_and_inc_(&blocks[processed..], results, offset + processed) {
+                IncResult::Success => break,
+                IncResult::NeedUpgrade(i) => {
+                    self.rep = self.rep.upgrade();
+                    processed += i;
+                }
+            }
+        }
+    }
+
+    fn lookup(&self, block: u64, results: &mut [u32]) -> u64 {
+        let b = block % REGION_SIZE as u64;
+        let e = (b as usize + results.len()).min(REGION_SIZE);
+
+        match &self.rep {
+            NoCounts => {
+                // All zeroes
+                results[0..(e - b as usize)].fill(0);
+            }
+            Bits(bits) => {
+                for i in (b as usize)..e {
+                    results[i - b as usize] = if bits.contains(i) { 1 } else { 0 };
+                }
+            }
+            U8s(counts) => {
+                for i in (b as usize)..e {
+                    results[i - b as usize] = counts[i] as u32;
+                }
+            }
+            U16s(counts) => {
+                for i in (b as usize)..e {
+                    results[i - b as usize] = counts[i] as u32;
+                }
+            }
+            U32s(counts) => {
+                for i in (b as usize)..e {
+                    results[i - b as usize] = counts[i];
+                }
+            }
+        }
+        e as u64 - b
+    }
 
     /// Name clash with RefCount.set()
-    pub fn set(&mut self, pairs: &[(u64, u32)]) {
+    fn set(&mut self, pairs: &[(u64, u32)]) {
         let mut processed = 0;
         while processed < pairs.len() {
             match self.set_(&pairs[processed..]) {
@@ -364,7 +338,131 @@ impl Region {
             U32s(_) => REGION_SIZE * 4,
         }
     }
+
+    fn nr_allocated(&self) -> u32 {
+        self.nr_allocated
+    }
 }
+
+//--------------------------------
+
+#[derive(Default)]
+pub struct RestrictedTwoRegion {
+    data: Vec<u8>, // 4 entries per byte
+    nr_allocated: u32,
+}
+
+impl RestrictedTwoRegion {
+    fn get_(&self, index: usize) -> u8 {
+        let byte_idx = index / 4;
+        let bit_offset = (index % 4) * 2;
+        (self.data[byte_idx] >> bit_offset) & 0b11
+    }
+
+    fn set_(&mut self, index: usize, value: u8) {
+        let byte_idx = index / 4;
+        let bit_offset = (index % 4) * 2;
+        self.data[byte_idx] =
+            (self.data[byte_idx] & !(0b11 << bit_offset)) | ((value & 0b11) << bit_offset);
+    }
+}
+
+impl Region for RestrictedTwoRegion {
+    fn increment(&mut self, blocks: &[u64]) {
+        if self.data.is_empty() {
+            self.data = vec![0; REGION_SIZE / 4];
+        }
+
+        for &block in blocks {
+            let b = block % REGION_SIZE as u64;
+            let current = self.get_(b as usize);
+
+            if current < 2 {
+                if current == 0 {
+                    self.nr_allocated += 1;
+                }
+                self.set_(b as usize, current + 1);
+            }
+        }
+    }
+
+    fn lookup(&self, block: u64, results: &mut [u32]) -> u64 {
+        let b = block % REGION_SIZE as u64;
+        let e = (b as usize + results.len()).min(REGION_SIZE);
+
+        if self.data.is_empty() {
+            // All zeroes
+            results[0..(e - b as usize)].fill(0);
+            return e as u64 - b;
+        }
+
+        for i in (b as usize)..e {
+            results[i - b as usize] = self.get_(i) as u32;
+        }
+        e as u64 - b
+    }
+
+    fn set(&mut self, pairs: &[(u64, u32)]) {
+        for &(block, rc) in pairs {
+            let b = block % REGION_SIZE as u64;
+            let rc_before = if self.data.is_empty() {
+                0
+            } else {
+                self.get_(b as usize)
+            };
+
+            let rc_saturated = rc.min(2) as u8;
+            if rc_saturated == rc_before {
+                continue;
+            }
+
+            if self.data.is_empty() {
+                self.data = vec![0; REGION_SIZE / 4];
+            }
+
+            self.set_(b as usize, rc_saturated);
+
+            if rc_before == 0 {
+                // rc changed from 0, meaning the new rc > 0
+                self.nr_allocated += 1;
+            } else if rc_before != 0 && rc_saturated == 0 {
+                self.nr_allocated -= 1;
+            }
+        }
+    }
+
+    fn test_and_inc(&mut self, blocks: &[u64], results: &mut FixedBitSet, offset: usize) {
+        if self.data.is_empty() {
+            self.data = vec![0; REGION_SIZE / 4];
+        }
+
+        for (i, &block) in blocks.iter().enumerate() {
+            let b = block % REGION_SIZE as u64;
+            let current_rc = self.get_(b as usize);
+            results.set(offset + i, current_rc > 0);
+            if current_rc < 2 {
+                if current_rc == 0 {
+                    self.nr_allocated += 1;
+                }
+                self.set_(b as usize, current_rc + 1);
+            }
+        }
+    }
+
+    fn rep_size(&self) -> usize {
+        if self.data.is_empty() {
+            0
+        } else {
+            REGION_SIZE / 4
+        }
+    }
+
+    fn nr_allocated(&self) -> u32 {
+        self.nr_allocated
+    }
+}
+
+//--------------------------------
 
 /// Aggregates reference count increments across multiple regions.
 ///
@@ -394,13 +492,13 @@ impl Region {
 ///
 /// - **Batch Processing:** Aggregating increments in larger batches can improve
 ///   cache locality and reduce synchronization costs.
-pub struct Aggregator {
+pub struct AggregatorImpl<R: Region> {
     nr_entries: usize,
-    regions: Vec<Mutex<Region>>,
+    regions: Vec<Mutex<R>>,
     nr_allocated: Mutex<u64>,
 }
 
-impl Aggregator {
+impl<R: Region> AggregatorImpl<R> {
     /// Creates a new `Aggregator` with the specified number of entries.
     ///
     /// The number of regions is determined based on the `REGION_SIZE`. Each
@@ -421,9 +519,7 @@ impl Aggregator {
     /// ```
     pub fn new(nr_entries: usize) -> Self {
         let nr_regions = nr_entries.div_ceil(REGION_SIZE);
-        let regions = (0..nr_regions)
-            .map(|_| Mutex::new(Region::default()))
-            .collect();
+        let regions = (0..nr_regions).map(|_| Mutex::new(R::default())).collect();
         Self {
             nr_entries,
             regions,
@@ -495,6 +591,43 @@ impl Aggregator {
         self.nr_entries
     }
 
+    /// Retrieves the reference counts for a range of blocks.
+    ///
+    /// This method allows you to look up the reference counts for a contiguous range of blocks,
+    /// starting from the specified `begin` block. It fills the provided `results` slice with
+    /// the reference counts and returns the number of blocks actually processed.
+    ///
+    /// # Arguments
+    ///
+    /// * `begin` - The starting block number to look up.
+    /// * `results` - A mutable slice to store the retrieved reference counts. The length of this
+    ///   slice determines the maximum number of blocks to look up.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of blocks actually processed. This may be less than `results.len()` if
+    /// the range extends beyond the end of the Aggregator's entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use thinp::pdata::space_map::aggregator::Aggregator;
+    ///
+    /// let aggregator = Aggregator::new(1000);
+    /// // ... (assume some increments have been performed)
+    ///
+    /// let mut results = vec![0; 10];
+    /// let blocks_read = aggregator.lookup(500, &mut results);
+    /// println!("Read {} blocks, first few counts: {:?}", blocks_read, &results[..3]);
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - If `begin` is beyond the last entry in the Aggregator, this method will return 0 and
+    ///   leave `results` unchanged.
+    /// - The method will read up to `results.len()` blocks, but may read fewer if the end of
+    ///   the Aggregator's range is reached.
+    /// - This method is thread-safe and can be called concurrently with `increment` operations.
     pub fn lookup(&self, begin: u64, results: &mut [u32]) -> u64 {
         if begin >= self.nr_entries as u64 {
             return 0;
@@ -598,7 +731,7 @@ impl Aggregator {
     /// The callback is invoked with (global block number, self count, other count).
     ///
     /// Panics if the two aggregators do not manage the same number of entries.
-    pub fn diff<F>(&self, other: &Aggregator, mut f: F)
+    pub fn diff<F>(&self, other: &AggregatorImpl<R>, mut f: F)
     where
         F: FnMut(u64, u32, u32),
     {
@@ -636,7 +769,7 @@ impl Aggregator {
         let mut total = 0;
         for i in 0..self.regions.len() {
             let region = self.regions[i].lock().unwrap();
-            total += std::mem::size_of::<Mutex<Region>>();
+            total += std::mem::size_of::<Mutex<R>>();
             total += region.rep_size();
         }
         total
@@ -652,9 +785,9 @@ impl Aggregator {
         }
 
         let mut region = self.regions[region_idx as usize].lock().unwrap();
-        let allocated_before = region.nr_allocated;
+        let allocated_before = region.nr_allocated();
         region.increment(blocks);
-        (region.nr_allocated - allocated_before) as u64
+        (region.nr_allocated() - allocated_before) as u64
     }
 
     fn process_region_test_and_inc(
@@ -669,9 +802,9 @@ impl Aggregator {
         }
 
         let mut region = self.regions[region_idx as usize].lock().unwrap();
-        let allocated_before = region.nr_allocated;
+        let allocated_before = region.nr_allocated();
         region.test_and_inc(blocks, results, results_offset);
-        (region.nr_allocated - allocated_before) as u64
+        (region.nr_allocated() - allocated_before) as u64
     }
 
     fn process_region_set(&self, region_idx: u64, pairs: &[(u64, u32)]) -> (u64, u64) {
@@ -680,13 +813,13 @@ impl Aggregator {
         }
 
         let mut region = self.regions[region_idx as usize].lock().unwrap();
-        let allocated_before = region.nr_allocated;
+        let allocated_before = region.nr_allocated();
         region.set(pairs);
 
-        if region.nr_allocated >= allocated_before {
-            ((region.nr_allocated - allocated_before) as u64, 0)
+        if region.nr_allocated() >= allocated_before {
+            ((region.nr_allocated() - allocated_before) as u64, 0)
         } else {
-            (0, (allocated_before - region.nr_allocated) as u64)
+            (0, (allocated_before - region.nr_allocated()) as u64)
         }
     }
 
@@ -701,7 +834,7 @@ impl Aggregator {
     }
 }
 
-impl RefCount for Aggregator {
+impl<R: Region> RefCount for AggregatorImpl<R> {
     fn get_nr_blocks(&self) -> Result<u64> {
         Ok(self.get_nr_blocks() as u64)
     }
@@ -729,7 +862,7 @@ impl RefCount for Aggregator {
 }
 
 // FIXME: only doing this as a stop gap solution
-impl SpaceMap for Aggregator {
+impl<R: Region> SpaceMap for AggregatorImpl<R> {
     fn get_nr_allocated(&self) -> Result<u64> {
         let nr_allocated = self.nr_allocated.lock().unwrap();
         Ok(*nr_allocated)
@@ -753,6 +886,9 @@ impl SpaceMap for Aggregator {
     }
 }
 
+pub type Aggregator = AggregatorImpl<U32Region>;
+pub type RestrictedTwoAggregator = AggregatorImpl<RestrictedTwoRegion>;
+
 //--------------------------------
 
 #[cfg(test)]
@@ -761,7 +897,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    fn from_rep(rep: Rep) -> Region {
+    fn from_rep(rep: U32Rep) -> U32Region {
         let nr_allocated = match &rep {
             NoCounts => 0,
             Bits(bits) => bits.count_ones(..),
@@ -770,12 +906,12 @@ mod tests {
             U32s(counts) => counts.iter().filter(|&x| *x != 0).count(),
         } as u32;
 
-        Region { rep, nr_allocated }
+        U32Region { rep, nr_allocated }
     }
 
     #[test]
     fn test_initial_no_counts() {
-        let mut region = Region::default();
+        let mut region = U32Region::default();
         let blocks = [1, 2, 3];
         let result = region.increment_(&blocks);
         assert!(matches!(result, IncResult::NeedUpgrade(0)));
@@ -806,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_full_upgrade_path() {
-        let mut region = Region::default();
+        let mut region = U32Region::default();
         // Initial increment should request upgrade
         let result = region.increment_(&[1]);
         assert!(matches!(result, IncResult::NeedUpgrade(0)));
@@ -892,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_region_lookup_no_counts() {
-        let region = Region::default();
+        let region = U32Region::default();
         let mut results = vec![0; 10];
         let blocks_read = region.lookup(5, &mut results);
         assert_eq!(blocks_read, 10);
@@ -995,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_region_test_and_inc_no_counts() {
-        let mut region = Region::default();
+        let mut region = U32Region::default();
         let blocks = vec![1, 2, 3];
         let mut results = FixedBitSet::with_capacity(3);
         region.test_and_inc(&blocks, &mut results, 0);
@@ -1122,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_region_set_no_counts() {
-        let mut region = Region::default();
+        let mut region = U32Region::default();
         let pairs = vec![(1, 0), (2, 1), (3, 2)];
         region.set(&pairs);
 
@@ -1326,6 +1462,109 @@ mod tests {
         // Set all allocated blocks to zero
         aggregator.set_batch(&[(2, 0), (3, 0), (4, 0), (5, 0), (6, 0)]);
         assert_eq!(aggregator.get_nr_allocated().unwrap(), 0);
+    }
+}
+
+//--------------------------------
+
+#[cfg(test)]
+mod restricted_two_aggregator_tests {
+    use super::*;
+
+    #[test]
+    fn test_region_default() {
+        let region = RestrictedTwoRegion::default();
+        assert_eq!(region.nr_allocated(), 0);
+        assert_eq!(region.rep_size(), 0);
+        assert!(region.data.is_empty());
+    }
+
+    #[test]
+    fn test_region_increment() {
+        let mut region = RestrictedTwoRegion::default();
+        region.increment(&[0, 1, 2, 3]);
+
+        assert_eq!(region.nr_allocated(), 4);
+
+        let mut results = vec![0; 4];
+        assert_eq!(region.lookup(0, &mut results), 4);
+        assert_eq!(results, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_region_saturating_increment() {
+        let mut region = RestrictedTwoRegion::default();
+
+        region.increment(&[10, 10, 10, 10]);
+
+        assert_eq!(region.nr_allocated(), 1);
+
+        let mut results = vec![0; REGION_SIZE];
+        region.lookup(0, &mut results);
+        assert!(results[0..10].iter().all(|v| *v == 0));
+        assert_eq!(results[10], 2);
+        assert!(results[11..].iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn test_region_saturating_set() {
+        let mut region = RestrictedTwoRegion::default();
+        region.set(&[(0, 16), (1, 32), (2, 64), (3, 128)]);
+
+        assert_eq!(region.nr_allocated(), 4);
+
+        let mut results = vec![0; REGION_SIZE];
+        assert_eq!(region.lookup(0, &mut results), REGION_SIZE as u64);
+        assert!(results[0..4].iter().all(|v| *v == 2));
+        assert!(results[4..].iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn test_region_allocation_tracking_with_set() {
+        let mut region = RestrictedTwoRegion::default();
+
+        region.set(&[(10, 1), (11, 2), (12, 1)]);
+        assert_eq!(region.nr_allocated(), 3);
+
+        // Free one allocation
+        region.set(&[(10, 0)]);
+        assert_eq!(region.nr_allocated(), 2);
+        let mut results = vec![0u32; REGION_SIZE];
+        assert_eq!(region.lookup(10, &mut results[..1]), 1);
+        assert_eq!(results[0], 0);
+
+        // Update allocation
+        region.set(&[(11, 1)]);
+        assert_eq!(region.nr_allocated(), 2);
+        assert_eq!(region.lookup(11, &mut results[..1]), 1);
+        assert_eq!(results[0], 1);
+
+        // Free all
+        region.set(&[(11, 0), (12, 0)]);
+        assert_eq!(region.nr_allocated(), 0);
+        assert_eq!(region.lookup(0, &mut results), REGION_SIZE as u64);
+        assert!(results.iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn test_region_test_and_inc() {
+        let mut region = RestrictedTwoRegion::default();
+
+        let mut results = FixedBitSet::with_capacity(10);
+        region.test_and_inc(&[1, 2, 3], &mut results, 3);
+        assert!(results.is_clear());
+        assert_eq!(region.nr_allocated(), 3);
+
+        region.test_and_inc(&[2, 3, 4], &mut results, 3);
+        assert!(!results.contains_any_in_range(0..3));
+        assert!(results.contains_all_in_range(3..5));
+        assert!(!results.contains_any_in_range(5..10));
+        assert_eq!(region.nr_allocated(), 4);
+
+        let mut lookup_results = vec![0u32; REGION_SIZE];
+        assert_eq!(region.lookup(0, &mut lookup_results), REGION_SIZE as u64);
+        assert_eq!(&lookup_results[0..5], &[0, 1, 2, 2, 1]);
+        assert!(lookup_results[5..].iter().all(|v| *v == 0));
     }
 }
 

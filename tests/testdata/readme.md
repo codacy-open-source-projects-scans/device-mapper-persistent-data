@@ -10,9 +10,15 @@ List of packed thin-pool metadata for tests:
   metadata snapshot.
 * corrupted_tmeta_with_metadata_snap.pack: Data structures except that of the
   metadata snapshot are all corrupted.
-* tmeta_device_id_reuse: Two different subtrees share the same device id
-* tmeta_device_id_reuse_with_corrupted_thins: Same as above but the subtree in
+* tmeta_device_id_reuse.pack: Two different subtrees share the same device id
+* tmeta_device_id_reuse_with_corrupted_thins.pack: Same as above but the subtree in
   metadata snapshot broke.
+* tmeta_with_empty_roots.pack: An empty mapping tree root was committed in previous
+  transactions. thin_repair should lower the priority of this node.
+- tmeta_with_shared_internal_root.pack: A snapshot is sharing the root with its origin,
+  in which the root is an internal node.
+- tmeta_with_shared_internals_and_leaves.pack: A snapshot is sharing some internal
+  and leaf nodes with its origin.
 
 List of packed era metadata for tests:
 
