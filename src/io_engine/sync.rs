@@ -52,6 +52,18 @@ impl<'a> SyncReader<'a> {
         F: FnMut(u64, io::Result<&[u8]>) -> io::Result<()>,
     {
         let block_size = self.io_blocks.get_block_size();
+
+        // The indices are adjacent, so none is representable if the first isn't
+        let pos = match block_offset(block_indices[0], block_size) {
+            Ok(pos) => pos,
+            Err(e) => {
+                for &index in block_indices {
+                    callback(index, Err(io::Error::from(e.kind())))?;
+                }
+                return Ok(());
+            }
+        };
+
         let mut bufs = Vec::with_capacity(block_indices.len());
         let mut io_blocks = Vec::with_capacity(block_indices.len());
 
@@ -77,7 +89,7 @@ impl<'a> SyncReader<'a> {
         // Read the blocks
         let results = self
             .reader
-            .read_blocks(&mut buf_refs, block_indices[0] * block_size as u64)
+            .read_blocks(&mut buf_refs, pos)
             .map_err(io::Error::other)?;
 
         // Process results and invoke callback
@@ -205,6 +217,8 @@ impl SyncIoEngine {
         let mut results: Vec<Result<Block>> = Vec::with_capacity(bs.len());
         let mut bs_index = 0;
 
+        // Keeps gap buffers alive during the vectored io
+        #[allow(clippy::collection_is_never_read)]
         let mut gaps: Vec<Block> = Vec::with_capacity(16);
 
         for batch in batches {
@@ -218,7 +232,7 @@ impl SyncIoEngine {
                         if first.is_none() {
                             first = Some(*b);
                         }
-                        for b in *b..*e {
+                        for b in *b..=*e {
                             assert_eq!(b, bs[issued_minus_gaps].as_ref().unwrap().loc);
                             buffers.push(bs[issued_minus_gaps].as_ref().unwrap().get_data());
                             issued_minus_gaps += 1;
@@ -230,7 +244,7 @@ impl SyncIoEngine {
                         if first.is_none() {
                             first = Some(*b);
                         }
-                        for loc in *b..*e {
+                        for loc in *b..=*e {
                             let gap_buffer = Block::new(loc);
                             buffers.push(gap_buffer.get_data());
                             gaps.push(gap_buffer);
@@ -242,7 +256,10 @@ impl SyncIoEngine {
             assert!(first.is_some());
 
             // Issue io
-            let run_results = vio.read_blocks(&mut buffers[..], first.unwrap() * BLOCK_SIZE as u64);
+            let run_results = match offset_of(first.unwrap()) {
+                Ok(pos) => vio.read_blocks(&mut buffers[..], pos),
+                Err(e) => Err(e.into()),
+            };
 
             if let Ok(run_results) = run_results {
                 // select results
@@ -250,7 +267,7 @@ impl SyncIoEngine {
                 for op in batch {
                     match op {
                         RunOp::Run(b, e) => {
-                            for i in b..e {
+                            for i in b..=e {
                                 if run_results[rindex].is_err() {
                                     results.push(Self::bad_read());
                                 } else {
@@ -263,7 +280,9 @@ impl SyncIoEngine {
                             }
                         }
                         RunOp::Gap(b, e) => {
-                            rindex += (e - b) as usize;
+                            // Never overflows since the widest possible gap is
+                            // [1, u64::MAX-1], length (u64::MAX - 1).
+                            rindex += (e - b + 1) as usize;
                         }
                     }
                 }
@@ -272,7 +291,7 @@ impl SyncIoEngine {
                 for op in batch {
                     match op {
                         RunOp::Run(b, e) => {
-                            for _ in b..e {
+                            for _ in b..=e {
                                 results.push(Self::bad_read());
                                 bs_index += 1;
                             }
@@ -284,7 +303,11 @@ impl SyncIoEngine {
                 }
             }
         }
-        assert_eq!(results.len(), blocks.len());
+
+        // sanity check the batch decomposition
+        if results.len() != blocks.len() {
+            return Self::bad_read();
+        }
 
         Ok(results)
     }
@@ -309,7 +332,12 @@ impl SyncIoEngine {
                 .iter()
                 .map(|b| b.as_ref())
                 .collect();
-            let run_results = vio.write_blocks(&buffers, batch_start * BLOCK_SIZE as u64);
+
+            let run_results = match offset_of(batch_start) {
+                Ok(pos) => vio.write_blocks(&buffers, pos),
+                Err(e) => Err(e.into()),
+            };
+
             issued += batch_size;
 
             if let Ok(run_results) = run_results {
@@ -322,6 +350,11 @@ impl SyncIoEngine {
                     results.push(Err(Self::bad_write()));
                 }
             }
+        }
+
+        // sanity check the batch decomposition
+        if results.len() != blocks.len() {
+            return Err(Self::bad_write());
         }
 
         Ok(results)
@@ -339,8 +372,7 @@ impl IoEngine for SyncIoEngine {
 
     fn read(&self, loc: u64) -> Result<Block> {
         let b = Block::new(loc);
-        self.file
-            .read_exact_at(b.get_data(), b.loc * BLOCK_SIZE as u64)?;
+        self.file.read_exact_at(b.get_data(), offset_of(b.loc)?)?;
         Ok(b)
     }
 
@@ -349,8 +381,7 @@ impl IoEngine for SyncIoEngine {
     }
 
     fn write(&self, b: &Block) -> Result<()> {
-        self.file
-            .write_all_at(b.get_data(), b.loc * BLOCK_SIZE as u64)?;
+        self.file.write_all_at(b.get_data(), offset_of(b.loc)?)?;
         Ok(())
     }
 

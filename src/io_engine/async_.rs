@@ -195,7 +195,14 @@ impl<'a> AsyncReader<'a> {
                 && !self.io_blocks.is_empty()
             {
                 let start_block = block_indices[blocks_read as usize];
-                let offset = start_block * self.io_blocks.get_block_size() as u64;
+                let offset = match block_offset(start_block, self.io_blocks.get_block_size()) {
+                    Ok(offset) => offset,
+                    Err(e) => {
+                        callback(start_block, Err(e));
+                        blocks_read += 1;
+                        continue;
+                    }
+                };
 
                 // Prepare the next IO request
                 let (io_data, blocks_this_read) =
@@ -209,6 +216,11 @@ impl<'a> AsyncReader<'a> {
                 } else {
                     break;
                 }
+            }
+
+            // Skip waiting for completion if all remaining blocks failed offset checks
+            if inflight == 0 {
+                continue;
             }
 
             // Submit and wait for completions
@@ -336,7 +348,7 @@ impl IoEngine for AsyncIoEngine {
 
     fn read(&self, b: u64) -> Result<Block> {
         let block = Block::new(b);
-        let loc = b * BLOCK_SIZE as u64;
+        let loc = offset_of(b)?;
 
         // Prepare read operation
         let read_op = opcode::Read::new(
@@ -383,7 +395,14 @@ impl IoEngine for AsyncIoEngine {
                     let idx = completed + inflight;
                     if let Some(block) = &block_data[idx] {
                         let block_idx = blocks[idx];
-                        let offset = block_idx * BLOCK_SIZE as u64;
+                        let offset = match offset_of(block_idx) {
+                            Ok(offset) => offset,
+                            Err(e) => {
+                                results[idx] = Err(e);
+                                completed += 1;
+                                continue;
+                            }
+                        };
 
                         // Prepare read operation
                         let read_op = opcode::Read::new(
@@ -406,6 +425,11 @@ impl IoEngine for AsyncIoEngine {
                         // This shouldn't happen, but just in case
                         completed += 1;
                     }
+                }
+
+                // Skip waiting for completion if all remaining blocks failed offset checks
+                if inflight == 0 {
+                    continue;
                 }
 
                 // Submit operations and wait for at least one completion
@@ -457,7 +481,7 @@ impl IoEngine for AsyncIoEngine {
     }
 
     fn write(&self, block: &Block) -> Result<()> {
-        let loc = block.loc * BLOCK_SIZE as u64;
+        let loc = offset_of(block.loc)?;
 
         // Prepare write operation
         let write_op = opcode::Write::new(
@@ -497,7 +521,14 @@ impl IoEngine for AsyncIoEngine {
                 while completed + inflight < blocks.len() && inflight < QUEUE_DEPTH as usize {
                     let idx = completed + inflight;
                     let block = &blocks[idx];
-                    let offset = block.loc * BLOCK_SIZE as u64;
+                    let offset = match offset_of(block.loc) {
+                        Ok(offset) => offset,
+                        Err(e) => {
+                            results[idx] = Err(e);
+                            completed += 1;
+                            continue;
+                        }
+                    };
 
                     // Prepare write operation
                     let write_op = opcode::Write::new(
@@ -516,6 +547,11 @@ impl IoEngine for AsyncIoEngine {
                     }
 
                     inflight += 1;
+                }
+
+                // Skip waiting for completion if all remaining blocks failed offset checks
+                if inflight == 0 {
+                    continue;
                 }
 
                 // Submit operations and wait for at least one completion

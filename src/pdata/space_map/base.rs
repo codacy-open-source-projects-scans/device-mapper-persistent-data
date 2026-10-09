@@ -47,6 +47,19 @@ pub type ASpaceMap = Arc<Mutex<dyn SpaceMap + Sync + Send>>;
 
 //------------------------------------------
 
+// Checks that [begin, begin + len) is within [0, nr_blocks).
+// Avoids computing begin + len to prevent overflow, and checks
+// begin > nr_blocks first to prevent nr_blocks - begin from underflowing.
+#[inline]
+fn check_range(begin: u64, len: u64, nr_blocks: u64) -> Result<()> {
+    if begin > nr_blocks || len > nr_blocks - begin {
+        return Err(anyhow!("block out of bounds"));
+    }
+    Ok(())
+}
+
+//------------------------------------------
+
 pub struct CoreSpaceMap<T> {
     nr_allocated: u64,
     alloc_begin: u64,
@@ -63,14 +76,6 @@ where
             alloc_begin: 0,
             counts: vec![V::default(); nr_entries as usize],
         }
-    }
-
-    #[inline]
-    fn check_index_out_of_bounds(&self, b: u64) -> Result<()> {
-        if b >= self.counts.len() as u64 {
-            return Err(anyhow!("block out of bounds"));
-        }
-        Ok(())
     }
 }
 
@@ -92,12 +97,12 @@ where
     }
 
     fn get(&self, b: u64) -> Result<u32> {
-        self.check_index_out_of_bounds(b)?;
+        check_range(b, 1, self.get_nr_blocks()?)?;
         Ok(self.counts[b as usize].into())
     }
 
     fn set(&mut self, b: u64, v: u32) -> Result<u32> {
-        self.check_index_out_of_bounds(b)?;
+        check_range(b, 1, self.get_nr_blocks()?)?;
 
         let old = self.get(b)?;
         self.counts[b as usize] = v.try_into().map_err(|e| anyhow!("{}", e))?;
@@ -112,9 +117,7 @@ where
     }
 
     fn inc(&mut self, begin: u64, len: u64) -> Result<()> {
-        if begin + len > self.counts.len() as u64 {
-            return Err(anyhow!("block out of bounds"));
-        }
+        check_range(begin, len, self.get_nr_blocks()?)?;
 
         for b in begin..(begin + len) {
             let c = &mut self.counts[b as usize];
@@ -165,6 +168,10 @@ where
     }
 
     fn find_free(&mut self, begin: u64, end: u64) -> Result<Option<u64>> {
+        if end > self.counts.len() as u64 {
+            return Err(anyhow!("block out of bounds"));
+        }
+
         for b in begin..end {
             if self.counts[b as usize] == V::from(0u8) {
                 return Ok(Some(b));
@@ -217,14 +224,6 @@ impl RestrictedSpaceMap {
             alloc_begin: 0,
         }
     }
-
-    #[inline]
-    fn check_index_out_of_bounds(&self, b: u64) -> Result<()> {
-        if b >= self.counts.len() as u64 {
-            return Err(anyhow!("block out of bounds"));
-        }
-        Ok(())
-    }
 }
 
 impl RefCount for RestrictedSpaceMap {
@@ -233,7 +232,7 @@ impl RefCount for RestrictedSpaceMap {
     }
 
     fn get(&self, b: u64) -> Result<u32> {
-        self.check_index_out_of_bounds(b)?;
+        check_range(b, 1, self.get_nr_blocks()?)?;
 
         if self.counts.contains(b as usize) {
             Ok(1)
@@ -243,7 +242,7 @@ impl RefCount for RestrictedSpaceMap {
     }
 
     fn set(&mut self, b: u64, v: u32) -> Result<u32> {
-        self.check_index_out_of_bounds(b)?;
+        check_range(b, 1, self.get_nr_blocks()?)?;
 
         let old = self.counts.contains(b as usize);
 
@@ -263,7 +262,7 @@ impl RefCount for RestrictedSpaceMap {
     }
 
     fn inc(&mut self, begin: u64, len: u64) -> Result<()> {
-        self.check_index_out_of_bounds(begin + len - 1)?;
+        check_range(begin, len, self.get_nr_blocks()?)?;
 
         for b in begin..(begin + len) {
             if !self.counts.contains(b as usize) {
@@ -297,132 +296,12 @@ impl SpaceMap for RestrictedSpaceMap {
     }
 
     fn find_free(&mut self, begin: u64, end: u64) -> Result<Option<u64>> {
-        self.check_index_out_of_bounds(end - 1)?;
+        if end > self.counts.len() as u64 {
+            return Err(anyhow!("block out of bounds"));
+        }
 
         for b in begin..end {
             if !self.counts.contains(b as usize) {
-                return Ok(Some(b));
-            }
-        }
-        Ok(None)
-    }
-
-    fn get_alloc_begin(&self) -> Result<u64> {
-        Ok(self.alloc_begin as u64)
-    }
-}
-
-//------------------------------------------
-
-// This in core space map can only count to two.
-// It's useful when we want to know which blocks
-// are shared as a result of btree visiting, and
-// aren't interested in the actual reference counts.
-pub struct RestrictedTwoSpaceMap {
-    nr_allocated: u64,
-    alloc_begin: usize,
-    counts: FixedBitSet,
-}
-
-impl RestrictedTwoSpaceMap {
-    pub fn new(nr_entries: u64) -> RestrictedTwoSpaceMap {
-        RestrictedTwoSpaceMap {
-            nr_allocated: 0,
-            counts: FixedBitSet::with_capacity((nr_entries << 1) as usize),
-            alloc_begin: 0,
-        }
-    }
-}
-
-impl RefCount for RestrictedTwoSpaceMap {
-    fn get_nr_blocks(&self) -> Result<u64> {
-        Ok((self.counts.len() >> 1) as u64)
-    }
-
-    fn get(&self, b: u64) -> Result<u32> {
-        let idx = (b << 1) as usize;
-        if self.counts.contains(idx) {
-            Ok(1)
-        } else if self.counts.contains(idx + 1) {
-            Ok(2)
-        } else {
-            Ok(0)
-        }
-    }
-
-    fn set(&mut self, b: u64, v: u32) -> Result<u32> {
-        let old = self.get(b)?;
-
-        if v > 0 {
-            if old == 0 {
-                self.nr_allocated += 1;
-            }
-            let idx = (b << 1) as usize;
-            if v == 1 {
-                self.counts.insert(idx);
-                self.counts.set(idx + 1, false);
-            } else if v == 2 {
-                self.counts.set(idx, false);
-                self.counts.insert(idx + 1);
-            }
-        } else {
-            if old == 1 {
-                self.nr_allocated -= 1;
-            }
-            let idx = (b << 1) as usize;
-            self.counts.set(idx, false);
-            self.counts.set(idx + 1, false);
-        }
-
-        Ok(old)
-    }
-
-    fn inc(&mut self, begin: u64, len: u64) -> Result<()> {
-        for b in begin..(begin + len) {
-            let idx = (b << 1) as usize;
-
-            // already hit the upper bound
-            if self.counts.contains(idx + 1) {
-                continue;
-            }
-
-            if self.counts.contains(idx) {
-                self.counts.set(idx, false);
-                self.counts.insert(idx + 1);
-            } else {
-                self.nr_allocated += 1;
-                self.counts.insert(idx);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl SpaceMap for RestrictedTwoSpaceMap {
-    fn get_nr_allocated(&self) -> Result<u64> {
-        Ok(self.nr_allocated)
-    }
-
-    fn alloc(&mut self) -> Result<Option<u64>> {
-        let mut b = self.find_free(self.alloc_begin as u64, self.counts.len() as u64)?;
-        if b.is_none() {
-            b = self.find_free(0, self.alloc_begin as u64)?;
-            if b.is_none() {
-                return Ok(None);
-            }
-        }
-
-        self.counts.insert((b.unwrap() << 1) as usize);
-        self.nr_allocated += 1;
-        self.alloc_begin = b.unwrap() as usize + 1;
-
-        Ok(b)
-    }
-
-    fn find_free(&mut self, begin: u64, end: u64) -> Result<Option<u64>> {
-        for b in begin..end {
-            let idx = (b << 1) as usize;
-            if !self.counts.contains(idx) && !self.counts.contains(idx + 1) {
                 return Ok(Some(b));
             }
         }

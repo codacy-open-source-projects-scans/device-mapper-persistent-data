@@ -25,14 +25,14 @@ impl FromStr for RangeU64 {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut iter = s.split("..");
-        let start = iter.next().map_or_else(
-            || Err(anyhow!("badly formed region")),
-            |s| s.parse::<u64>().map_err(|e| e.into()),
-        )?;
-        let end = iter.next().map_or_else(
-            || Err(anyhow!("badly formed region")),
-            |s| s.parse::<u64>().map_err(|e| e.into()),
-        )?;
+        let start = iter
+            .next()
+            .ok_or_else(|| anyhow!("badly formed region"))?
+            .parse::<u64>()?;
+        let end = iter
+            .next()
+            .ok_or_else(|| anyhow!("badly formed region"))?
+            .parse::<u64>()?;
         if iter.next().is_some() {
             return Err(anyhow!("badly formed region"));
         }
@@ -134,13 +134,9 @@ pub fn is_metadata(path: &Path) -> Result<bool> {
 }
 
 pub fn yes_no_prompt(report: &Report, prompt: &str) -> Result<bool> {
-    report
-        .get_prompt_input(&format!("{} [y/n]: ", prompt))
-        .map(|input| {
-            let input = input.trim_end().to_lowercase();
-            input.eq("yes") || input.eq("y")
-        })
-        .map_err(|e| e.into())
+    let input = report.get_prompt_input(&format!("{} [y/n]: ", prompt))?;
+    let input = input.trim_end().to_lowercase();
+    Ok(input == "yes" || input == "y")
 }
 
 /// Reads the start of the file to see if it's a metadata.
@@ -164,10 +160,8 @@ pub fn to_exit_code<T>(report: &Report, result: anyhow::Result<T>) -> exitcode::
         let root_cause = e.root_cause();
         let is_broken_pipe = root_cause
             .downcast_ref::<Arc<std::io::Error>>() // quick_xml::Error::Io wraps io::Error in Arc
-            .map_or_else(
-                || root_cause.downcast_ref::<std::io::Error>(),
-                |err| Some(err.as_ref()),
-            )
+            .map(|err| err.as_ref())
+            .or_else(|| root_cause.downcast_ref::<std::io::Error>())
             .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe);
 
         if !is_broken_pipe {

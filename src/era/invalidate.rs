@@ -140,11 +140,12 @@ fn mark_blocks_since(
     }
 
     if let Some(archived_begin) = wsets.keys().next() {
-        if *archived_begin as u32 > threshold {
-            marked_bits =
-                collate_era_array(engine.clone(), sb.era_array_root, marked_bits, threshold)?;
+        if *archived_begin as u32 <= threshold {
+            return Ok(marked_bits);
         }
     }
+
+    marked_bits = collate_era_array(engine.clone(), sb.era_array_root, marked_bits, threshold)?;
 
     Ok(marked_bits)
 }
@@ -254,8 +255,8 @@ pub fn invalidate(opts: &EraInvalidateOptions) -> Result<()> {
         read_superblock(ctx.engine.as_ref(), SUPERBLOCK_LOCATION)?
     };
 
-    let w: Box<dyn Write> = if opts.output.is_some() {
-        Box::new(BufWriter::new(File::create(opts.output.unwrap())?))
+    let w: Box<dyn Write> = if let Some(output) = opts.output {
+        Box::new(BufWriter::new(File::create(output)?))
     } else {
         Box::new(BufWriter::new(std::io::stdout()))
     };

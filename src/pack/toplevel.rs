@@ -96,6 +96,9 @@ pub fn pack(input_file: &Path, output_file: &Path) -> Result<()> {
     for t in threads {
         t.join().unwrap()?;
     }
+
+    sync_output.lock().unwrap().sync_all()?;
+
     Ok(())
 }
 
@@ -309,5 +312,8 @@ pub fn unpack(input_file: &Path, output_file: &Path) -> Result<()> {
     for t in threads {
         t.join().unwrap()?;
     }
+
+    output.lock().unwrap().sync_all()?;
+
     Ok(())
 }

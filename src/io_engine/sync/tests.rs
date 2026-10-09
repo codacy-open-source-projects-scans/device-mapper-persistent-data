@@ -118,3 +118,153 @@ fn test_split_long_run() -> Result<()> {
 }
 
 //------------------------------------------
+
+const MAX_REPRESENTABLE_BLOCK: u64 = u64::MAX / BLOCK_SIZE as u64;
+
+// A block number whose byte offset is not representable can never be read.
+// IoEngine::read_many() must return per-block error, rather than panicking
+// or failing the whole batch.
+#[test]
+fn test_unrepresentable_block_address() {
+    let mut v = MockVio::new();
+    let blocks = [MAX_REPRESENTABLE_BLOCK + 1];
+
+    v.expect_read_vectored_at().times(0);
+    let results = SyncIoEngine::read_many_(v.into(), &blocks).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err());
+}
+
+#[test]
+fn test_unrepresentable_block_address_in_batch() {
+    let mut v = MockVio::new();
+    let blocks = [0, 1, MAX_REPRESENTABLE_BLOCK + 1, 2, 3];
+
+    let batch = std::sync::atomic::AtomicUsize::default();
+    v.expect_read_vectored_at()
+        .times(2)
+        .withf(move |bufs, pos| {
+            let expected = [(0u64, 2usize), (2 * BLOCK_SIZE as u64, 2)];
+            let n = batch.fetch_add(1, Ordering::SeqCst);
+            assert_eq!((*pos, bufs.len()), expected[n]);
+            true
+        })
+        .returning(|bufs, _| Ok(bufs.iter().map(|buf| buf.iov_len).sum()));
+
+    let results = SyncIoEngine::read_many_(v.into(), &blocks).unwrap();
+    assert_eq!(results.len(), blocks.len());
+    for (i, r) in results.iter().enumerate() {
+        if i == 2 {
+            assert!(r.is_err());
+        } else {
+            assert_eq!(r.as_ref().unwrap().loc, blocks[i]);
+        }
+    }
+}
+
+#[test]
+fn test_read_last_representable_block() {
+    let mut v = MockVio::new();
+
+    v.expect_read_vectored_at()
+        .times(1)
+        .withf(|bufs, pos| {
+            assert_eq!(*pos, MAX_REPRESENTABLE_BLOCK * BLOCK_SIZE as u64);
+            assert_eq!(bufs.len(), 1);
+            true
+        })
+        .returning(|bufs, _| Ok(bufs.iter().map(|buf| buf.iov_len).sum()));
+
+    let results = SyncIoEngine::read_many_(v.into(), &[MAX_REPRESENTABLE_BLOCK]).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].as_ref().unwrap().loc, MAX_REPRESENTABLE_BLOCK);
+}
+
+#[test]
+fn test_read_trims_unrepresentable_tail() {
+    let mut v = MockVio::new();
+    let blocks = [MAX_REPRESENTABLE_BLOCK, MAX_REPRESENTABLE_BLOCK + 1];
+
+    v.expect_read_vectored_at()
+        .times(1)
+        .withf(|bufs, pos| {
+            assert_eq!(*pos, MAX_REPRESENTABLE_BLOCK * BLOCK_SIZE as u64);
+            assert_eq!(bufs.len(), 1, "only the representable block may be issued");
+            true
+        })
+        .returning(|bufs, _| Ok(bufs.iter().map(|buf| buf.iov_len).sum()));
+
+    let results = SyncIoEngine::read_many_(v.into(), &blocks).unwrap();
+    assert_eq!(results.len(), blocks.len());
+    assert_eq!(results[0].as_ref().unwrap().loc, MAX_REPRESENTABLE_BLOCK);
+    assert!(results[1].is_err());
+}
+
+#[test]
+fn test_write_unrepresentable_block_address() {
+    let mut v = MockVio::new();
+    v.expect_write_vectored_at().times(0);
+    let blocks = [Block::new(MAX_REPRESENTABLE_BLOCK + 1)];
+    let results = SyncIoEngine::write_many_(v.into(), &blocks).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err());
+}
+
+fn engine_of(nr_blocks: u64) -> SyncIoEngine {
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(nr_blocks * BLOCK_SIZE as u64).unwrap();
+    SyncIoEngine { nr_blocks, file }
+}
+
+#[test]
+fn test_read_one_unrepresentable_block_address() {
+    let engine = engine_of(1);
+    let err = engine.read(MAX_REPRESENTABLE_BLOCK + 1).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn test_write_one_unrepresentable_block_address() {
+    let engine = engine_of(1);
+    let b = Block::zeroed(MAX_REPRESENTABLE_BLOCK + 1);
+    let err = engine.write(&b).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[derive(Default)]
+struct ResultCollector {
+    results: Vec<(u64, bool)>,
+}
+
+impl ReadHandler for ResultCollector {
+    fn handle(&mut self, loc: u64, data: io::Result<&[u8]>) {
+        self.results.push((loc, data.is_ok()));
+    }
+
+    fn complete(&mut self) {}
+}
+
+// Streaming reads in io blocks larger than BLOCK_SIZE must still report an
+// unrepresentable address as a per-block error.
+#[test]
+fn test_stream_unrepresentable_block_address() {
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(BLOCK_SIZE as u64).unwrap();
+
+    let mut pool = BufferPool::new(16, 64 * 1024);
+    let mut reader = SyncReader::new(&file, &mut pool).unwrap();
+    let mut handler = ResultCollector::default();
+    let blocks = [0, MAX_REPRESENTABLE_BLOCK + 1];
+
+    reader
+        .stream_blocks(&mut blocks.into_iter(), &mut handler)
+        .unwrap();
+
+    handler.results.sort_unstable();
+    assert_eq!(
+        handler.results,
+        vec![(0, true), (MAX_REPRESENTABLE_BLOCK + 1, false)]
+    );
+}
+
+//------------------------------------------

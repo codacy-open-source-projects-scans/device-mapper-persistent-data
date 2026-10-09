@@ -121,31 +121,23 @@ impl Default for Events {
 //------------------------------------
 
 fn ls_next(ls: &mut ListState, max: usize) {
+    if max == 0 {
+        return;
+    }
+
     let i = match ls.selected() {
-        Some(i) => {
-            if i >= max - 1 {
-                max - 1
-            } else {
-                i + 1
-            }
-        }
+        Some(i) => (i + 1).min(max - 1),
         None => 0,
     };
     ls.select(Some(i));
 }
 
 fn ls_previous(ls: &mut ListState) {
-    let i = match ls.selected() {
-        Some(i) => {
-            if i == 0 {
-                0
-            } else {
-                i - 1
-            }
+    if let Some(i) = ls.selected() {
+        if i > 0 {
+            ls.select(Some(i - 1));
         }
-        None => 0,
-    };
-    ls.select(Some(i));
+    }
 }
 
 //------------------------------------
@@ -444,24 +436,17 @@ impl<V: Unpack + fmt::Display + Adjacent + Copy> StatefulWidget for NodeWidget<'
         };
         hdr.render(chunks[0], buf);
 
-        let items: Vec<ListItem>;
-        let i: usize;
-        let selected = state.selected().unwrap();
+        let selected = state.selected().unwrap_or(0);
         let mut state = ListState::default();
 
-        match self.node {
-            btree::Node::Internal { keys, values, .. } => {
-                let (items_, i_) = mk_items(keys, values, selected);
-                items = items_;
-                i = i_;
-            }
-            btree::Node::Leaf { keys, values, .. } => {
-                let (items_, i_) = mk_items(keys, values, selected);
-                items = items_;
-                i = i_;
-            }
+        let (items, i) = match self.node {
+            btree::Node::Internal { keys, values, .. } => mk_items(keys, values, selected),
+            btree::Node::Leaf { keys, values, .. } => mk_items(keys, values, selected),
+        };
+
+        if !items.is_empty() {
+            state.select(Some(i));
         }
-        state.select(Some(i));
 
         let items = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("Entries"))
@@ -559,7 +544,10 @@ impl DeviceDetailPanel {
     fn new(node: btree::Node<DeviceDetail>) -> DeviceDetailPanel {
         let nr_entries = node.get_header().nr_entries as usize;
         let mut state = ListState::default();
-        state.select(Some(0));
+
+        if nr_entries > 0 {
+            state.select(Some(0));
+        }
 
         DeviceDetailPanel {
             node,
@@ -629,7 +617,10 @@ impl TopLevelPanel {
     fn new(node: btree::Node<u64>) -> TopLevelPanel {
         let nr_entries = node.get_header().nr_entries as usize;
         let mut state = ListState::default();
-        state.select(Some(0));
+
+        if nr_entries > 0 {
+            state.select(Some(0));
+        }
 
         TopLevelPanel {
             node,
@@ -663,11 +654,10 @@ impl Panel for TopLevelPanel {
                 btree::Node::Internal { values, .. } => {
                     Some(PushTopLevel(values[self.state.selected().unwrap()]))
                 }
-                btree::Node::Leaf { values, keys, .. } => {
-                    let index = self.state.selected().unwrap();
-
-                    Some(PushBottomLevel(keys[index] as u32, values[index]))
-                }
+                btree::Node::Leaf { values, keys, .. } => self
+                    .state
+                    .selected()
+                    .map(|index| PushBottomLevel(keys[index] as u32, values[index])),
             },
             Key::Char('h') | Key::Left => Some(PopPanel),
             _ => None,
@@ -711,7 +701,10 @@ impl BottomLevelPanel {
     fn new(thin_id: u32, node: btree::Node<BlockTime>) -> BottomLevelPanel {
         let nr_entries = node.get_header().nr_entries as usize;
         let mut state = ListState::default();
-        state.select(Some(0));
+
+        if nr_entries > 0 {
+            state.select(Some(0));
+        }
 
         BottomLevelPanel {
             thin_id,
